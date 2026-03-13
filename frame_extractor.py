@@ -26,7 +26,7 @@ TOP_N_SHARP    = 150         # keep top-N by Laplacian score before Gemini
 GEMINI_SELECTS = 10          # how many frames Gemini picks
 DISPLAY_N      = 10          # frames shown in the UI grid
 THUMB_W, THUMB_H = 320, 240  # resize before sending to Gemini (saves tokens)
-GEMINI_MODEL   = "gemini-3-flash"     # latest flagship Flash model (March 2026)
+GEMINI_MODEL   = "gemini-2.5-flash"   # supported Flash model for generate_content
 # ────────────────────────────────────────────────────────────────────────────
 
 
@@ -65,9 +65,35 @@ def gemini_select(top_frames, api_key: str, progress_cb=None):
     model = genai.GenerativeModel(GEMINI_MODEL)
 
     prompt = (
-        "You are a professional photo editor reviewing video frame candidates.\n"
-        "From these candidate frames, select the 10 best based on composition, "
-        "lighting, and subject clarity.\n"
+        "You are a professional photo editor curating frames for a vertical photo strip. "
+        "Your job is to select the most expressive, flattering, and narratively cohesive frames "
+        "using the same criteria as a high-end event photographer.\n"
+        "\n"
+        "TECHNICAL REQUIREMENTS (hard filters — disqualify any frame that fails these):\n"
+        "- Eyes of the primary subject must be sharp and in focus (eyes are the absolute priority).\n"
+        "- No heavy accidental motion blur on faces.\n"
+        "- No faces cut off at the frame edge or turned more than ~90 degrees away.\n"
+        "- No faces more than 30% obscured by hair, hands, or other objects.\n"
+        "- Skin tones should look natural — avoid blown highlights or harsh shadows on the face.\n"
+        "\n"
+        "FLATTERY & DIGNITY FILTERS (prefer frames that pass all of these):\n"
+        "- Eyes are clearly open — avoid blinks and 'blink-adjacent' half-closed eyes.\n"
+        "- Avoid mid-chew, mid-sentence, or mid-drink frames where the mouth looks distorted.\n"
+        "- Prefer frames where the jawline is defined (chin slightly forward/down, not pulled back).\n"
+        "- For laughter, pick the 'tail end' — after the peak — where eyes are open and joy is still visible, not the wide-open-mouth peak that reads like a scream.\n"
+        "\n"
+        "EXPRESSION QUALITY (ranked by preference):\n"
+        "1. Duchenne smile — genuine smile that reaches the eyes (crow's feet, brightened gaze).\n"
+        "2. Authentic laughter or strong reaction — relaxed jaw, real emotion.\n"
+        "3. Quiet connection — contemplation, awe, or a soft meaningful look.\n"
+        "4. Neutral with strong eye contact — confident and readable.\n"
+        "Reject forced or 'canned' smiles where only the mouth moves but the eyes are flat.\n"
+        "\n"
+        "SEQUENCING GOAL (think like a storyteller, not just a quality filter):\n"
+        "- Select frames that together form a narrative arc: vary between wider context shots and tight emotional close-ups.\n"
+        "- Avoid picking multiple nearly identical frames — prioritize variety in expression and moment.\n"
+        "- The strongest frame should anchor the selection; supporting frames should add context or contrast.\n"
+        "\n"
         f"There are {len(top_frames)} frames indexed 0 to {len(top_frames)-1}.\n"
         'Return ONLY a JSON object exactly like: {"indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}'
     )

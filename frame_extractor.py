@@ -25,7 +25,7 @@ TOP_N_SHARP    = 150         # keep top-N by Laplacian score before Gemini
 GEMINI_SELECTS = 5           # how many frames Gemini picks
 DISPLAY_N      = 4           # frames shown in the UI grid
 THUMB_W, THUMB_H = 320, 240  # resize before sending to Gemini (saves tokens)
-GEMINI_MODEL   = "gemini-2.0-flash"   # change to gemini-2.5-flash-preview etc.
+GEMINI_MODEL   = "gemini-2.5-flash"   # newer, higher-quality vision model
 OUTPUT_DIR     = "output"
 # ────────────────────────────────────────────────────────────────────────────
 

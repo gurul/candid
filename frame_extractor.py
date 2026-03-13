@@ -3,7 +3,8 @@
 Video Frame Extractor — two-stage pipeline
   Stage 1 : OpenCV Laplacian-variance sharpness filter
   Stage 2 : Gemini visual selection
-  UI      : Tkinter 2×2 grid showing the 4 best frames
+  UI      : Tkinter 2×5 scrollable grid showing the 10 best frames
+            with per-frame Download buttons (no auto-save)
 """
 
 import cv2
@@ -22,11 +23,10 @@ from PIL import Image, ImageTk
 # ── Config ──────────────────────────────────────────────────────────────────
 SAMPLE_EVERY_N = 30          # sample 1 frame every N frames
 TOP_N_SHARP    = 150         # keep top-N by Laplacian score before Gemini
-GEMINI_SELECTS = 5           # how many frames Gemini picks
-DISPLAY_N      = 4           # frames shown in the UI grid
+GEMINI_SELECTS = 10          # how many frames Gemini picks
+DISPLAY_N      = 10          # frames shown in the UI grid
 THUMB_W, THUMB_H = 320, 240  # resize before sending to Gemini (saves tokens)
 GEMINI_MODEL   = "gemini-3-flash"     # latest flagship Flash model (March 2026)
-OUTPUT_DIR     = "output"
 # ────────────────────────────────────────────────────────────────────────────
 
 
@@ -66,10 +66,10 @@ def gemini_select(top_frames, api_key: str, progress_cb=None):
 
     prompt = (
         "You are a professional photo editor reviewing video frame candidates.\n"
-        "From these candidate frames, select the 5 best based on composition, "
+        "From these candidate frames, select the 10 best based on composition, "
         "lighting, and subject clarity.\n"
         f"There are {len(top_frames)} frames indexed 0 to {len(top_frames)-1}.\n"
-        'Return ONLY a JSON object exactly like: {"indices": [0, 1, 2, 3, 4]}'
+        'Return ONLY a JSON object exactly like: {"indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}'
     )
 
     parts = [prompt]
@@ -105,17 +105,6 @@ def gemini_select(top_frames, api_key: str, progress_cb=None):
     return picked[:GEMINI_SELECTS]
 
 
-# ── Save ─────────────────────────────────────────────────────────────────────
-def save_frames(frames_data, output_dir=OUTPUT_DIR):
-    os.makedirs(output_dir, exist_ok=True)
-    paths = []
-    for rank, (frame, score, orig_idx) in enumerate(frames_data, 1):
-        path = os.path.join(output_dir, f"best_{rank}_frame{orig_idx}.jpg")
-        cv2.imwrite(path, frame)
-        paths.append(path)
-    return paths
-
-
 # ── UI ───────────────────────────────────────────────────────────────────────
 BG       = "#0d1117"
 BG2      = "#161b22"
@@ -131,8 +120,10 @@ class App(tk.Tk):
         super().__init__()
         self.title("Video Frame Extractor")
         self.configure(bg=BG)
-        self.minsize(760, 620)
+        self.minsize(860, 700)
         self._tk_images: list[ImageTk.PhotoImage] = []
+        # store raw frames for download: list of (bgr_frame, score, orig_idx)
+        self._frame_data: list = []
         self._build_ui()
 
     # ── layout ───────────────────────────────────────────────────────────────
@@ -205,38 +196,90 @@ class App(tk.Tk):
         # divider
         tk.Frame(self, bg=BG2, height=1).pack(fill="x")
 
-        # frame grid label
-        tk.Label(self, text="Best frames selected by Gemini",
-                 fg=MUTED, bg=BG, font=("Helvetica", 9, "italic")).pack(pady=(8, 0))
+        # section label + download-all button on same row
+        lbl_row = tk.Frame(self, bg=BG)
+        lbl_row.pack(fill="x", padx=20, pady=(8, 0))
+        tk.Label(lbl_row, text="Best frames selected by Gemini",
+                 fg=MUTED, bg=BG, font=("Helvetica", 9, "italic")).pack(side="left")
+        self.dl_all_btn = tk.Button(
+            lbl_row, text="⬇  Download All",
+            command=self._download_all,
+            bg=BG2, fg=ACCENT,
+            font=("Helvetica", 9, "bold"),
+            relief="flat", padx=10, pady=3, cursor="hand2",
+            state="disabled",
+        )
+        self.dl_all_btn.pack(side="right")
 
-        # 2×2 grid
-        grid = tk.Frame(self, bg=BG, padx=16, pady=8)
-        grid.pack(fill="both", expand=True)
-        self._cells: list[tk.Label] = []
+        # ── scrollable 2-column grid ─────────────────────────────────────────
+        wrapper = tk.Frame(self, bg=BG)
+        wrapper.pack(fill="both", expand=True, padx=12, pady=(6, 12))
+
+        canvas = tk.Canvas(wrapper, bg=BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(wrapper, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        self._grid_frame = tk.Frame(canvas, bg=BG)
+        self._canvas_window = canvas.create_window(
+            (0, 0), window=self._grid_frame, anchor="nw"
+        )
+
+        def _on_frame_configure(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(e):
+            canvas.itemconfig(self._canvas_window, width=e.width)
+
+        self._grid_frame.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # mouse-wheel scrolling
+        def _on_mousewheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # pre-build 10 cells (2 columns × 5 rows)
+        self._cells: list[tk.Label]  = []
         self._captions: list[tk.Label] = []
-        for r in range(2):
-            grid.rowconfigure(r, weight=1)
-            for c in range(2):
-                grid.columnconfigure(c, weight=1)
-                outer = tk.Frame(grid, bg=BG2, padx=2, pady=2)
-                outer.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
+        self._dl_btns: list[tk.Button] = []
 
-                img_lbl = tk.Label(outer, bg=BG2, text="",
-                                   relief="flat")
-                img_lbl.pack(fill="both", expand=True)
+        COLS = 2
+        for i in range(DISPLAY_N):
+            r, c = divmod(i, COLS)
+            self._grid_frame.columnconfigure(c, weight=1)
 
-                cap_lbl = tk.Label(outer, bg=BG2, fg=MUTED,
-                                   text=f"Slot {r*2+c+1}",
-                                   font=("Helvetica", 8))
-                cap_lbl.pack()
+            outer = tk.Frame(self._grid_frame, bg=BG2, padx=2, pady=2)
+            outer.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
 
-                self._cells.append(img_lbl)
-                self._captions.append(cap_lbl)
+            img_lbl = tk.Label(outer, bg=BG2, text="",
+                               relief="flat", cursor="hand2")
+            img_lbl.pack(fill="both", expand=True)
 
-        # footer
-        self.save_var = tk.StringVar()
-        tk.Label(self, textvariable=self.save_var,
-                 fg=SUCCESS, bg=BG, font=("Helvetica", 9)).pack(pady=(2, 10))
+            bottom = tk.Frame(outer, bg=BG2)
+            bottom.pack(fill="x")
+
+            cap_lbl = tk.Label(bottom, bg=BG2, fg=MUTED,
+                               text=f"Slot {i+1}",
+                               font=("Helvetica", 8), anchor="w")
+            cap_lbl.pack(side="left", padx=4, pady=2)
+
+            dl_btn = tk.Button(
+                bottom, text="⬇ Save",
+                command=lambda idx=i: self._download_single(idx),
+                bg=BG, fg=ACCENT,
+                font=("Helvetica", 8), relief="flat",
+                padx=6, pady=1, cursor="hand2",
+                state="disabled",
+            )
+            dl_btn.pack(side="right", padx=4, pady=2)
+
+            self._cells.append(img_lbl)
+            self._captions.append(cap_lbl)
+            self._dl_btns.append(dl_btn)
 
     def _ctrl_row(self, parent, label, var, browse_cmd=None, secret=False):
         row = tk.Frame(parent, bg=BG)
@@ -277,13 +320,12 @@ class App(tk.Tk):
             return
 
         self.run_btn.config(state="disabled")
-        self.save_var.set("")
+        self.dl_all_btn.config(state="disabled")
         self._clear_grid()
         threading.Thread(target=self._pipeline, args=(video, key), daemon=True).start()
 
     def _pipeline(self, video, key):
         try:
-            n = self.sample_var.get()
             top_n = self.top_var.get()
 
             self._update("Stage 1 — scanning frames with OpenCV…", 0)
@@ -291,7 +333,6 @@ class App(tk.Tk):
                 video,
                 progress_cb=lambda v: self._update(None, v),
             )
-            # respect UI spinbox value
             top = top[:top_n]
 
             self._update(
@@ -303,18 +344,45 @@ class App(tk.Tk):
                 progress_cb=lambda v: self._update(None, v),
             )
 
-            self._update("Saving frames to disk…", 92)
             selected = [top[i] for i in picked[:GEMINI_SELECTS]]
-            paths    = save_frames(selected)
 
-            self._update("Done ✓", 100)
-            self.after(0, lambda: self._show_frames(selected, paths))
+            self._update(f"Done ✓  —  {len(selected)} best frames selected", 100)
+            self.after(0, lambda: self._show_frames(selected))
 
         except Exception as exc:
             self.after(0, lambda e=exc: messagebox.showerror("Pipeline error", str(e)))
             self._update(f"Error: {exc}", 0)
         finally:
             self.after(0, lambda: self.run_btn.config(state="normal"))
+
+    # ── download helpers ──────────────────────────────────────────────────────
+    def _download_single(self, idx: int):
+        if idx >= len(self._frame_data):
+            return
+        frame, score, orig_idx = self._frame_data[idx]
+        default_name = f"best_{idx+1}_frame{orig_idx}.jpg"
+        path = filedialog.asksaveasfilename(
+            title="Save frame",
+            initialfile=default_name,
+            defaultextension=".jpg",
+            filetypes=[("JPEG image", "*.jpg"), ("PNG image", "*.png"), ("All files", "*.*")],
+        )
+        if path:
+            cv2.imwrite(path, frame)
+            self._update(f"Saved → {path}", self.progress["value"])
+
+    def _download_all(self):
+        if not self._frame_data:
+            return
+        folder = filedialog.askdirectory(title="Choose folder to save all frames")
+        if not folder:
+            return
+        saved = 0
+        for i, (frame, score, orig_idx) in enumerate(self._frame_data):
+            path = os.path.join(folder, f"best_{i+1}_frame{orig_idx}.jpg")
+            cv2.imwrite(path, frame)
+            saved += 1
+        self._update(f"Saved {saved} frame(s) → {folder}", self.progress["value"])
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _update(self, msg, value):
@@ -324,24 +392,30 @@ class App(tk.Tk):
 
     def _clear_grid(self):
         self._tk_images.clear()
-        for lbl, cap in zip(self._cells, self._captions):
+        self._frame_data.clear()
+        for lbl, cap, btn in zip(self._cells, self._captions, self._dl_btns):
             lbl.config(image="", text="")
             cap.config(text="")
+            btn.config(state="disabled")
 
-    def _show_frames(self, frames_data, paths):
+    def _show_frames(self, frames_data):
         self._tk_images.clear()
-        for i, (lbl, cap_lbl) in enumerate(zip(self._cells, self._captions)):
+        self._frame_data = list(frames_data)
+
+        for i, (lbl, cap_lbl, dl_btn) in enumerate(
+            zip(self._cells, self._captions, self._dl_btns)
+        ):
             if i >= len(frames_data):
                 lbl.config(image="", text="")
                 cap_lbl.config(text="")
+                dl_btn.config(state="disabled")
                 continue
 
             frame, score, orig_idx = frames_data[i]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(rgb)
 
-            # fit inside the cell dynamically
-            cell_w = max(lbl.winfo_width(),  340)
+            cell_w = max(lbl.winfo_width(),  360)
             cell_h = max(lbl.winfo_height(), 240)
             img.thumbnail((cell_w - 4, cell_h - 4), Image.LANCZOS)
 
@@ -353,9 +427,9 @@ class App(tk.Tk):
                 text=f"Rank {i+1}  |  frame #{orig_idx}  |  sharpness {score:,.0f}",
                 fg=TEXT,
             )
+            dl_btn.config(state="normal")
 
-        abs_out = os.path.abspath(OUTPUT_DIR)
-        self.save_var.set(f"Saved {len(frames_data)} frame(s) → {abs_out}")
+        self.dl_all_btn.config(state="normal")
 
 
 # ── entry point ──────────────────────────────────────────────────────────────

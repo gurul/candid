@@ -26,7 +26,7 @@ from PIL import Image, ImageTk
 SAMPLE_EVERY_N   = 30
 TOP_N_SHARP      = 150
 GEMINI_SELECTS   = 10
-DISPLAY_N        = 10
+DISPLAY_N        = 50   # max pre-built grid cells (covers full selects_var range)
 THUMB_W, THUMB_H = 320, 240
 GEMINI_MODEL     = "gemini-2.5-flash"
 GEMINI_BATCH     = 30
@@ -179,13 +179,13 @@ def _gemini_pick_batch(model, batch_frames, batch_offset: int,
     return []
 
 
-def gemini_select(top_frames, api_key: str, progress_cb=None,
-                  cancel_event: threading.Event = None) -> list[int]:
+def gemini_select(top_frames, api_key: str, n_select: int = GEMINI_SELECTS,
+                  progress_cb=None, cancel_event: threading.Event = None) -> list[int]:
     genai.configure(api_key=api_key)
     model   = genai.GenerativeModel(GEMINI_MODEL)
     n       = len(top_frames)
     batches = [top_frames[i:i + GEMINI_BATCH] for i in range(0, n, GEMINI_BATCH)]
-    per_batch_select = max(3, GEMINI_SELECTS // len(batches) + 1)
+    per_batch_select = max(3, n_select // len(batches) + 1)
 
     finalists = []
     for b_idx, batch in enumerate(batches):
@@ -207,15 +207,15 @@ def gemini_select(top_frames, api_key: str, progress_cb=None,
     if progress_cb:
         progress_cb(78)
 
-    if len(finalists) <= GEMINI_SELECTS:
+    if len(finalists) <= n_select:
         return [f[3] for f in finalists]
 
     final_batch  = [(f[0], f[1], f[2]) for f in finalists]
     final_picks  = _gemini_pick_batch(model, final_batch, 0,
-                                      GEMINI_SELECTS, cancel_event)
+                                      n_select, cancel_event)
     if progress_cb:
         progress_cb(90)
-    return [finalists[i][3] for i in final_picks[:GEMINI_SELECTS]]
+    return [finalists[i][3] for i in final_picks[:n_select]]
 
 
 # ── Zoom window ───────────────────────────────────────────────────────────────
@@ -362,13 +362,15 @@ class App(tk.Tk):
         opt = tk.Frame(ctrl, bg=BG)
         opt.pack(anchor="w", pady=(0, 12))
 
-        self.sample_var = tk.IntVar(value=SAMPLE_EVERY_N)
-        self.top_var    = tk.IntVar(value=TOP_N_SHARP)
-        self.gap_var    = tk.IntVar(value=TEMPORAL_GAP)
+        self.sample_var  = tk.IntVar(value=SAMPLE_EVERY_N)
+        self.top_var     = tk.IntVar(value=TOP_N_SHARP)
+        self.gap_var     = tk.IntVar(value=TEMPORAL_GAP)
+        self.selects_var = tk.IntVar(value=GEMINI_SELECTS)
 
-        self._spin(opt, "SAMPLE EVERY",  self.sample_var, 1,    120)
-        self._spin(opt, "TOP SHARP",     self.top_var,    5,    300)
-        self._spin(opt, "MIN FRAME GAP", self.gap_var,    0,   9999)
+        self._spin(opt, "SAMPLE EVERY",  self.sample_var,  1,    120)
+        self._spin(opt, "TOP SHARP",     self.top_var,     5,    300)
+        self._spin(opt, "MIN FRAME GAP", self.gap_var,     0,   9999)
+        self._spin(opt, "FRAMES TO PICK", self.selects_var, 1,     50)
 
         # buttons
         btn_row = tk.Frame(ctrl, bg=BG)
@@ -631,6 +633,7 @@ class App(tk.Tk):
             sample_every = self.sample_var.get()
             top_n        = self.top_var.get()
             min_gap      = self.gap_var.get()
+            n_select     = max(1, self.selects_var.get())
 
             self._update("01 / scanning with OpenCV…", 0)
             raw = extract_sharp_frames(
@@ -650,7 +653,7 @@ class App(tk.Tk):
             )
 
             picked = gemini_select(
-                diverse, key,
+                diverse, key, n_select=n_select,
                 progress_cb=lambda v: self._update(None, v),
                 cancel_event=self._cancel_event,
             )
@@ -659,7 +662,7 @@ class App(tk.Tk):
                 self._update("Cancelled.", 0)
                 return
 
-            selected = [diverse[i] for i in picked[:GEMINI_SELECTS]]
+            selected = [diverse[i] for i in picked[:n_select]]
             self._update(f"{len(selected)} frames selected.", 100)
             self.after(0, lambda: self._show_frames(selected))
 

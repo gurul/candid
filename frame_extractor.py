@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Video Frame Extractor — two-stage pipeline
-  Stage 1 : OpenCV Laplacian-variance sharpness filter + temporal diversity
-  Stage 2 : Gemini visual selection (chunked batches with retry)
-  UI      : Tkinter 2×5 scrollable grid showing the 10 best frames
-            with per-frame Download buttons, click-to-zoom, cancel support
+Candid Photo Strip — question-aware pipeline
+  Stage 1 : Extract audio from video (ffmpeg)
+  Stage 2 : Transcribe audio → timestamped chunks (Gemini Files API)
+  Stage 3 : Map 4 user questions to time windows (gap detection + equal-split fallback)
+  Stage 4 : For each window — OpenCV sharpness filter → Gemini picks 1 best frame
+  UI      : Tkinter vertical photo strip (4 frames + question text per cell)
 """
 
 import cv2
@@ -13,6 +14,8 @@ import json
 import os
 import platform
 import re
+import subprocess
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -23,61 +26,72 @@ import google.genai as genai
 from PIL import Image, ImageTk
 
 # ── Config ──────────────────────────────────────────────────────────────────
-SAMPLE_EVERY_N   = 30
-TOP_N_SHARP      = 150
-GEMINI_SELECTS   = 10
-THUMB_W, THUMB_H = 320, 240
-GRID_COLS        = 2
-GEMINI_MODEL     = "gemini-2.5-flash"
-GEMINI_BATCH     = 30
-TEMPORAL_GAP     = 90
-MAX_RETRIES      = 3
-RETRY_DELAY      = 2.0
+NUM_QUESTIONS     = 4
+TOP_SHARP_PER_SEG = 20       # candidate frames per segment sent to Gemini
+SAMPLE_EVERY_N    = 15       # sample every N frames (denser for short windows)
+THUMB_W, THUMB_H  = 320, 240 # thumbnail size for Gemini calls
+STRIP_THUMB_W     = 520      # thumbnail width in results strip
+STRIP_THUMB_H     = 390      # thumbnail height in results strip
+GEMINI_MODEL      = "gemini-2.5-flash"
+MAX_RETRIES       = 3
+RETRY_DELAY       = 2.0
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Palette — pure black & white ─────────────────────────────────────────────
-BG      = "#000000"   # true black
-BG2     = "#0a0a0a"   # near-black panels
-BORDER  = "#1c1c1c"   # subtle borders
-MUTED   = "#444444"   # secondary text
-TEXT    = "#aaaaaa"   # body text
-WHITE   = "#ffffff"   # primary / interactive
+BG      = "#000000"
+BG2     = "#0a0a0a"
+BORDER  = "#1c1c1c"
+MUTED   = "#444444"
+TEXT    = "#aaaaaa"
+WHITE   = "#ffffff"
 # ─────────────────────────────────────────────────────────────────────────────
 
-HOW_IT_WORKS = (
-    "Stage 1 — OpenCV samples 1 frame every N frames and scores each one with "
-    "Laplacian-variance sharpness. A temporal-diversity filter then prunes "
-    "near-duplicate frames so candidates are spread across the whole video. "
-    "The top candidates move to Stage 2 — Google Gemini evaluates them visually "
-    "(in batches to stay within token limits) and picks the 10 most expressive, "
-    "flattering, and narratively cohesive frames using professional photo-editor "
-    "criteria: open eyes, genuine Duchenne smiles, no motion blur, and story arc."
+HOW_IT_WORKS_1 = (
+    "Enter your 4 interview questions. The app transcribes the video audio "
+    "with Gemini and detects where each question's answer begins and ends. "
+    "If transcription is unclear, the video is split into equal windows."
+)
+HOW_IT_WORKS_2 = (
+    "For each of the 4 answer segments, OpenCV scores frames by sharpness "
+    "and the top candidates are sent to Gemini with the specific question as "
+    "context — so each panel gets the most expressive, relevant frame."
 )
 
 
-# ── Stage 1 : sharpness scoring ──────────────────────────────────────────────
-def extract_sharp_frames(video_path: str, sample_every: int, progress_cb=None,
+# ── Stage 1 helpers ──────────────────────────────────────────────────────────
+def extract_sharp_frames(video_path: str, sample_every: int, fps: float,
+                         start_s: float = 0.0, end_s: float = float("inf"),
+                         progress_cb=None,
                          cancel_event: threading.Event = None):
-    cap   = cv2.VideoCapture(video_path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    """Extract and rank frames by Laplacian sharpness within [start_s, end_s]."""
+    cap = cv2.VideoCapture(video_path)
+    start_frame = int(start_s * fps)
+    end_frame   = int(end_s   * fps)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
     frames, scores, orig_indices = [], [], []
-    idx = 0
+    idx = start_frame
+    span = max(end_frame - start_frame, 1)
+
     while True:
         if cancel_event and cancel_event.is_set():
             cap.release()
             return []
+        if idx >= end_frame:
+            break
         ret, frame = cap.read()
         if not ret:
             break
-        if idx % sample_every == 0:
+        if (idx - start_frame) % sample_every == 0:
             gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             score = cv2.Laplacian(gray, cv2.CV_64F).var()
             frames.append(frame.copy())
             scores.append(score)
             orig_indices.append(idx)
             if progress_cb:
-                progress_cb(min(idx / max(total, 1) * 48, 48))
+                progress_cb(min((idx - start_frame) / span * 100, 100))
         idx += 1
+
     cap.release()
     order = np.argsort(scores)[::-1]
     return [(frames[i], scores[i], orig_indices[i]) for i in order]
@@ -94,129 +108,210 @@ def get_video_metadata(video_path: str) -> dict:
             "duration_s": frames / fps, "width": width, "height": height}
 
 
-def temporal_diversity_filter(frames, min_gap: int, limit: int):
-    if min_gap <= 0:
-        return frames[:limit]
-    kept, last_orig = [], -min_gap - 1
-    for item in frames:
-        _f, _s, orig_idx = item
-        if orig_idx - last_orig >= min_gap:
-            kept.append(item)
-            last_orig = orig_idx
-            if len(kept) >= limit:
+# ── Audio extraction ─────────────────────────────────────────────────────────
+def extract_audio_to_wav(video_path: str,
+                         cancel_event: threading.Event = None) -> str:
+    """Extract mono 16 kHz PCM WAV from video using ffmpeg. Returns temp path."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    out_path = tmp.name
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-ac", "1",
+        out_path,
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    while proc.poll() is None:
+        if cancel_event and cancel_event.is_set():
+            proc.kill()
+            raise RuntimeError("Cancelled during audio extraction.")
+        time.sleep(0.2)
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg exited with code {proc.returncode}.")
+    return out_path
+
+
+# ── Transcription ─────────────────────────────────────────────────────────────
+def transcribe_audio(client: genai.Client, audio_path: str,
+                     cancel_event: threading.Event = None) -> list[dict]:
+    """
+    Upload WAV to Gemini Files API and get timestamped transcript chunks.
+    Returns list of {"start_s": float, "end_s": float, "text": str}.
+    Returns [] on any failure — caller uses equal-split fallback.
+    """
+    try:
+        uploaded = client.files.upload(
+            file=audio_path,
+            config=genai.types.UploadFileConfig(mime_type="audio/wav"),
+        )
+
+        # Poll until ACTIVE
+        for _ in range(30):
+            if cancel_event and cancel_event.is_set():
+                return []
+            f = client.files.get(name=uploaded.name)
+            if f.state.name == "ACTIVE":
                 break
-    return kept
+            time.sleep(2)
+        else:
+            return []
+
+        prompt = (
+            "You are a transcription engine. Listen to the attached audio and "
+            "produce a timestamped transcript broken into short chunks of 2–4 seconds each.\n"
+            "Return ONLY a JSON array — no prose, no markdown fences. Each element:\n"
+            '{"start_s": <float>, "end_s": <float>, "text": "<spoken words>"}\n'
+            "Include silent ranges as elements with empty text string.\n"
+            "Sort by start_s ascending."
+        )
+
+        audio_part = genai.types.Part.from_uri(
+            file_uri=uploaded.uri,
+            mime_type="audio/wav",
+        )
+
+        for attempt in range(MAX_RETRIES):
+            if cancel_event and cancel_event.is_set():
+                return []
+            try:
+                response = client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=[prompt, audio_part],
+                )
+                text = response.text.strip()
+                text = re.sub(r"^```[a-z]*\n?", "", text)
+                text = re.sub(r"\n?```$", "", text)
+                chunks = json.loads(text)
+                if isinstance(chunks, list) and all("start_s" in c for c in chunks):
+                    return chunks
+            except Exception:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (attempt + 1))
+    except Exception:
+        pass
+    return []
 
 
-# ── Stage 2 : Gemini selection ───────────────────────────────────────────────
-def _gemini_pick_batch(client, batch_frames, batch_offset: int,
-                       total_select: int, cancel_event) -> list[int]:
+# ── Segmentation ─────────────────────────────────────────────────────────────
+def equal_split_windows(questions: list[str], duration_s: float) -> list[dict]:
+    """Divide duration evenly into NUM_QUESTIONS windows."""
+    seg = duration_s / len(questions)
+    return [
+        {"q_idx": i, "question": q,
+         "start_s": i * seg, "end_s": (i + 1) * seg}
+        for i, q in enumerate(questions)
+    ]
+
+
+def map_transcript_to_windows(chunks: list[dict], questions: list[str],
+                               video_duration_s: float) -> list[dict]:
+    """
+    Find the N-1 largest silence gaps to split transcript into N question windows.
+    Falls back to equal_split_windows if gaps are too small or unclear.
+    """
+    n = len(questions)
+    if not chunks or n < 2:
+        return equal_split_windows(questions, video_duration_s)
+
+    # Compute gaps between consecutive chunks
+    gaps = []
+    for i in range(len(chunks) - 1):
+        gap_start = chunks[i]["end_s"]
+        gap_end   = chunks[i + 1]["start_s"]
+        gap_dur   = gap_end - gap_start
+        if gap_dur > 0:
+            gaps.append((gap_dur, gap_start))  # (duration, position)
+
+    # Need at least n-1 gaps of meaningful size
+    gaps.sort(reverse=True)
+    if len(gaps) < n - 1 or gaps[n - 2][0] < 0.3:
+        return equal_split_windows(questions, video_duration_s)
+
+    # Pick the n-1 largest gaps as boundaries, sorted by position
+    boundary_positions = sorted(g[1] for g in gaps[:n - 1])
+
+    # Build windows
+    boundaries = [0.0] + boundary_positions + [video_duration_s]
+    windows = []
+    for i, q in enumerate(questions):
+        windows.append({
+            "q_idx":   i,
+            "question": q,
+            "start_s": boundaries[i],
+            "end_s":   boundaries[i + 1],
+        })
+    return windows
+
+
+# ── Per-segment Gemini selection ──────────────────────────────────────────────
+def gemini_pick_one_frame(client: genai.Client, candidates: list,
+                          question_text: str,
+                          cancel_event: threading.Event = None) -> int:
+    """
+    Send up to TOP_SHARP_PER_SEG candidate frames to Gemini with a
+    question-specific prompt. Returns index into candidates of the best frame.
+    Returns 0 (sharpest) as safe fallback.
+    """
+    if not candidates:
+        return 0
+
     prompt = (
-        "You are a professional photo editor curating frames for a vertical photo strip. "
-        "Your job is to select the most expressive, flattering, and narratively cohesive frames "
-        "using the same criteria as a high-end event photographer.\n"
-        "\n"
-        "TECHNICAL REQUIREMENTS (hard filters — disqualify any frame that fails these):\n"
-        "- Eyes of the primary subject must be sharp and in focus (eyes are the absolute priority).\n"
-        "- No heavy accidental motion blur on faces.\n"
-        "- No faces cut off at the frame edge or turned more than ~90 degrees away.\n"
-        "- No faces more than 30% obscured by hair, hands, or other objects.\n"
-        "- Skin tones should look natural — avoid blown highlights or harsh shadows on the face.\n"
-        "\n"
-        "FLATTERY & DIGNITY FILTERS (prefer frames that pass all of these):\n"
-        "- Eyes are clearly open — avoid blinks and 'blink-adjacent' half-closed eyes.\n"
-        "- Avoid mid-chew, mid-sentence, or mid-drink frames where the mouth looks distorted.\n"
-        "- Prefer frames where the jawline is defined (chin slightly forward/down, not pulled back).\n"
-        "- For laughter, pick the 'tail end' — after the peak — where eyes are open and joy is still visible.\n"
-        "\n"
-        "EXPRESSION QUALITY (ranked by preference):\n"
-        "1. Duchenne smile — genuine smile that reaches the eyes (crow's feet, brightened gaze).\n"
-        "2. Authentic laughter or strong reaction — relaxed jaw, real emotion.\n"
-        "3. Quiet connection — contemplation, awe, or a soft meaningful look.\n"
-        "4. Neutral with strong eye contact — confident and readable.\n"
-        "Reject forced or 'canned' smiles where only the mouth moves but the eyes are flat.\n"
-        "\n"
-        "SEQUENCING GOAL (think like a storyteller, not just a quality filter):\n"
-        "- Select frames that together form a narrative arc.\n"
-        "- Avoid picking multiple nearly identical frames — prioritize variety.\n"
-        "\n"
-        f"There are {len(batch_frames)} frames indexed 0 to {len(batch_frames)-1}.\n"
-        f"You MUST return exactly {min(total_select, len(batch_frames))} indices — your best choices in order. "
-        f"If fewer than {total_select} frames meet the bar, still return that many (your top picks).\n"
-        'Return ONLY a JSON object exactly like: {"indices": [0, 1, 2]}'
+        f"You are selecting the single best photo for one panel of a printed photo strip.\n"
+        f"The interview question being answered in these frames is:\n"
+        f'  "{question_text}"\n\n'
+        f"There are {len(candidates)} frames indexed 0 to {len(candidates) - 1}.\n\n"
+        f"Choose the ONE frame that best captures the subject at a meaningful, "
+        f"expressive, or emotionally resonant moment while answering that question.\n\n"
+        f"Hard requirements (disqualify any frame that fails):\n"
+        f"- Eyes must be open and in sharp focus.\n"
+        f"- No heavy motion blur on the face.\n"
+        f"- Face must not be cut off at the edge or turned more than ~90° away.\n\n"
+        f"Preference order:\n"
+        f"1. Genuine expression — smile reaching the eyes, strong reaction, thoughtful look.\n"
+        f"2. Clear, confident eye contact with the camera.\n"
+        f"3. Neutral but sharp, flattering, and well-composed frame.\n\n"
+        f'Return ONLY a JSON object: {{"index": <integer>}}'
     )
 
     parts = [prompt]
-    for i, (frame, _score, _orig) in enumerate(batch_frames):
+    for i, (frame, _score, _orig) in enumerate(candidates):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
         img.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=80)
+        img.save(buf, format="JPEG", quality=82)
         parts.append(f"\nFrame {i}:")
         parts.append(genai.types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
 
-    if cancel_event and cancel_event.is_set():
-        return []
-
     for attempt in range(MAX_RETRIES):
         if cancel_event and cancel_event.is_set():
-            return []
+            return 0
         try:
             response = client.models.generate_content(
                 model=GEMINI_MODEL, contents=parts
             )
             text = response.text.strip()
-            m = re.search(r'\{[^{}]*"indices"[^{}]*\}', text, re.DOTALL)
+            m = re.search(r'\{"index"\s*:\s*(\d+)\}', text)
             if m:
-                raw = json.loads(m.group())["indices"]
-            else:
-                raw = list(map(int, re.findall(r'\b\d+\b', text)))
-            return [i for i in raw if isinstance(i, int) and 0 <= i < len(batch_frames)]
-        except Exception as exc:
+                idx = int(m.group(1))
+                if 0 <= idx < len(candidates):
+                    return idx
+            # Fallback: first integer in response
+            nums = re.findall(r'\b\d+\b', text)
+            if nums:
+                idx = int(nums[0])
+                if 0 <= idx < len(candidates):
+                    return idx
+        except Exception:
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAY * (attempt + 1))
-            else:
-                raise exc
-    return []
-
-
-def gemini_select(top_frames, api_key: str, n_select: int = GEMINI_SELECTS,
-                  progress_cb=None, cancel_event: threading.Event = None) -> list[int]:
-    client = genai.Client(api_key=api_key)
-    n      = len(top_frames)
-    batches = [top_frames[i:i + GEMINI_BATCH] for i in range(0, n, GEMINI_BATCH)]
-    per_batch_select = max(3, n_select // len(batches) + 1)
-
-    finalists = []
-    for b_idx, batch in enumerate(batches):
-        if cancel_event and cancel_event.is_set():
-            return []
-        if progress_cb:
-            progress_cb(55 + b_idx / len(batches) * 20)
-        local_picks   = _gemini_pick_batch(client, batch, b_idx * GEMINI_BATCH,
-                                           per_batch_select, cancel_event)
-        global_offset = b_idx * GEMINI_BATCH
-        for li in local_picks:
-            gi = global_offset + li
-            finalists.append((top_frames[gi][0], top_frames[gi][1],
-                              top_frames[gi][2], gi))
-
-    if not finalists or (cancel_event and cancel_event.is_set()):
-        return []
-
-    if progress_cb:
-        progress_cb(78)
-
-    if len(finalists) <= n_select:
-        return [f[3] for f in finalists]
-
-    final_batch  = [(f[0], f[1], f[2]) for f in finalists]
-    final_picks  = _gemini_pick_batch(client, final_batch, 0,
-                                      n_select, cancel_event)
-    if progress_cb:
-        progress_cb(90)
-    return [finalists[i][3] for i in final_picks[:n_select]]
+    return 0
 
 
 # ── Zoom window ───────────────────────────────────────────────────────────────
@@ -243,14 +338,15 @@ class ZoomWindow(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Frame Extractor")
+        self.title("Candid Photo Strip")
         self.configure(bg=BG)
-        self.minsize(900, 720)
-        self._tk_images:  list[ImageTk.PhotoImage] = []
-        self._frame_data: list                     = []
-        self._last_video_path: str | None          = None  # used for Save All folder
-        self._cancel_event  = threading.Event()
-        self._last_save_dir = os.path.expanduser("~/Pictures")
+        self.minsize(700, 720)
+        self._tk_images:      list[ImageTk.PhotoImage] = []
+        self._frame_data:     list[dict]               = []
+        self._last_video_path: str | None              = None
+        self._cancel_event   = threading.Event()
+        self._last_save_dir  = os.path.expanduser("~/Pictures")
+        self._question_labels: list[tk.Label]          = []
         self._build_ui()
 
     # ── build ─────────────────────────────────────────────────────────────────
@@ -259,7 +355,6 @@ class App(tk.Tk):
         self._build_how_it_works()
         self._build_controls()
         self._build_progress()
-        # Results section: built but not shown until processing completes
         self._results_section = tk.Frame(self, bg=BG)
         tk.Frame(self._results_section, bg=BORDER, height=1).pack(fill="x")
         self._build_results_header(self._results_section)
@@ -270,7 +365,7 @@ class App(tk.Tk):
         hdr.pack(fill="x", padx=32)
 
         tk.Label(
-            hdr, text="Frame Extractor",
+            hdr, text="Candid Photo Strip",
             font=("Helvetica", 22, "bold"),
             fg=WHITE, bg=BG, anchor="w",
         ).pack(side="left")
@@ -293,34 +388,17 @@ class App(tk.Tk):
             fg=MUTED, bg=BG, anchor="w",
         ).pack(anchor="w", pady=(0, 6))
 
-        # two-column layout: Stage 1 | Stage 2
         cols = tk.Frame(outer, bg=BG)
         cols.pack(fill="x")
         cols.columnconfigure(0, weight=1)
         cols.columnconfigure(1, weight=1)
 
-        self._info_card(
-            cols, col=0,
-            number="01",
-            title="OpenCV sharpness pass",
-            body=(
-                "Samples 1 frame every N frames. Each sample is scored with "
-                "Laplacian-variance — a fast, accurate measure of edge sharpness. "
-                "A temporal-diversity filter then prunes near-duplicate frames so "
-                "candidates are spread across the full timeline."
-            ),
-        )
-        self._info_card(
-            cols, col=1,
-            number="02",
-            title="Gemini visual selection",
-            body=(
-                "The sharpest candidates are sent to Gemini in batches. Gemini "
-                "evaluates them as a professional photo editor — prioritising open eyes, "
-                "genuine Duchenne smiles, flattering angles, and story arc — then "
-                "returns the 10 best frames."
-            ),
-        )
+        self._info_card(cols, col=0, number="01",
+                        title="Audio transcription & segmentation",
+                        body=HOW_IT_WORKS_1)
+        self._info_card(cols, col=1, number="02",
+                        title="Per-question Gemini frame selection",
+                        body=HOW_IT_WORKS_2)
 
         self._separator(pady=(16, 0))
 
@@ -328,24 +406,13 @@ class App(tk.Tk):
         card = tk.Frame(parent, bg=BG, padx=(0 if col == 0 else 24), pady=0)
         card.grid(row=0, column=col, sticky="nsew")
 
-        tk.Label(
-            card, text=number,
-            font=("Helvetica", 28, "bold"),
-            fg=BORDER, bg=BG, anchor="w",
-        ).pack(anchor="w")
-
-        tk.Label(
-            card, text=title,
-            font=("Helvetica", 11, "bold"),
-            fg=WHITE, bg=BG, anchor="w",
-        ).pack(anchor="w", pady=(0, 5))
-
-        tk.Label(
-            card, text=body,
-            font=("Helvetica", 9),
-            fg=TEXT, bg=BG, anchor="w",
-            justify="left", wraplength=360,
-        ).pack(anchor="w")
+        tk.Label(card, text=number, font=("Helvetica", 28, "bold"),
+                 fg=BORDER, bg=BG, anchor="w").pack(anchor="w")
+        tk.Label(card, text=title, font=("Helvetica", 11, "bold"),
+                 fg=WHITE, bg=BG, anchor="w").pack(anchor="w", pady=(0, 5))
+        tk.Label(card, text=body, font=("Helvetica", 9),
+                 fg=TEXT, bg=BG, anchor="w",
+                 justify="left", wraplength=360).pack(anchor="w")
 
     def _build_controls(self):
         ctrl = tk.Frame(self, bg=BG, padx=32, pady=16)
@@ -362,23 +429,20 @@ class App(tk.Tk):
                  fg=MUTED, bg=BG, font=("Helvetica", 8),
                  anchor="w").pack(anchor="w", pady=(0, 8))
 
-        # options row
-        opt = tk.Frame(ctrl, bg=BG)
-        opt.pack(anchor="w", pady=(0, 12))
+        # 4 question fields
+        tk.Label(ctrl, text="INTERVIEW QUESTIONS",
+                 font=("Helvetica", 7, "bold"),
+                 fg=MUTED, bg=BG, anchor="w").pack(anchor="w", pady=(4, 4))
 
-        self.sample_var  = tk.IntVar(value=SAMPLE_EVERY_N)
-        self.top_var     = tk.IntVar(value=TOP_N_SHARP)
-        self.gap_var     = tk.IntVar(value=TEMPORAL_GAP)
-        self.selects_var = tk.IntVar(value=GEMINI_SELECTS)
-
-        self._spin(opt, "SAMPLE EVERY",  self.sample_var,  1,    120)
-        self._spin(opt, "TOP SHARP",     self.top_var,     5,    300)
-        self._spin(opt, "MIN FRAME GAP", self.gap_var,     0,   9999)
-        self._spin(opt, "FRAMES TO PICK", self.selects_var, 1,     50)
+        self.question_vars = []
+        for i in range(NUM_QUESTIONS):
+            var = tk.StringVar()
+            self.question_vars.append(var)
+            self._field(ctrl, f"Q{i + 1}", var)
 
         # buttons
         btn_row = tk.Frame(ctrl, bg=BG)
-        btn_row.pack(anchor="w")
+        btn_row.pack(anchor="w", pady=(4, 0))
 
         self.run_btn = tk.Button(
             btn_row, text="Extract",
@@ -405,8 +469,7 @@ class App(tk.Tk):
         wrap = tk.Frame(parent, bg=BG)
         wrap.pack(fill="x", pady=(0, 10))
 
-        tk.Label(wrap, text=label,
-                 font=("Helvetica", 7, "bold"),
+        tk.Label(wrap, text=label, font=("Helvetica", 7, "bold"),
                  fg=MUTED, bg=BG, anchor="w").pack(anchor="w", pady=(0, 3))
 
         row = tk.Frame(wrap, bg=BG)
@@ -437,43 +500,21 @@ class App(tk.Tk):
                 activebackground=BORDER, activeforeground=WHITE,
             ).pack(side="left")
 
-    def _spin(self, parent, label, var, lo, hi):
-        grp = tk.Frame(parent, bg=BG)
-        grp.pack(side="left", padx=(0, 20))
-        tk.Label(grp, text=label,
-                 font=("Helvetica", 7, "bold"),
-                 fg=MUTED, bg=BG).pack(anchor="w", pady=(0, 3))
-        tk.Spinbox(
-            grp, from_=lo, to=hi, textvariable=var,
-            width=6,
-            bg=BG2, fg=WHITE, insertbackground=WHITE,
-            relief="flat", bd=0,
-            buttonbackground=BG2,
-            highlightthickness=1,
-            highlightbackground=BORDER,
-            highlightcolor=WHITE,
-            font=("Helvetica", 10),
-        ).pack()
-
     def _build_progress(self):
         prog = tk.Frame(self, bg=BG, padx=32)
         prog.pack(fill="x", pady=(0, 4))
 
         self.status_var = tk.StringVar(value="Ready")
         tk.Label(prog, textvariable=self.status_var,
-                 fg=MUTED, bg=BG,
-                 font=("Helvetica", 8),
+                 fg=MUTED, bg=BG, font=("Helvetica", 8),
                  anchor="w").pack(anchor="w", pady=(0, 4))
 
         style = ttk.Style(self)
         style.theme_use("clam")
         style.configure("TProgressbar",
-                        troughcolor=BG2,
-                        background=WHITE,
-                        bordercolor=BG,
-                        lightcolor=WHITE,
-                        darkcolor=WHITE,
-                        thickness=2)
+                        troughcolor=BG2, background=WHITE,
+                        bordercolor=BG, lightcolor=WHITE,
+                        darkcolor=WHITE, thickness=2)
         self.progress = ttk.Progressbar(prog, length=800,
                                         mode="determinate",
                                         style="TProgressbar")
@@ -487,8 +528,7 @@ class App(tk.Tk):
                  font=("Helvetica", 7, "bold"),
                  fg=MUTED, bg=BG).pack(side="left")
 
-        tk.Label(row,
-                 text="click any frame to zoom  ·  esc to close",
+        tk.Label(row, text="click any frame to zoom  ·  esc to close",
                  font=("Helvetica", 7),
                  fg=MUTED, bg=BG).pack(side="left", padx=12)
 
@@ -537,10 +577,10 @@ class App(tk.Tk):
             canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
             canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
 
-        self._cells:      list[tk.Label]   = []
-        self._captions:   list[tk.Label]   = []
-        self._dl_btns:    list[tk.Button]  = []
-        self._cell_frames: list[tk.Frame]  = []  # outer frames, for destroy on clear
+        self._cells:       list[tk.Label]  = []
+        self._captions:    list[tk.Label]  = []
+        self._dl_btns:     list[tk.Button] = []
+        self._cell_frames: list[tk.Frame]  = []
 
     def _separator(self, pady=(0, 0)):
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", pady=pady)
@@ -586,64 +626,123 @@ class App(tk.Tk):
             messagebox.showerror("Missing key", "Please enter your Gemini API key.")
             return
 
+        questions = [v.get().strip() for v in self.question_vars]
+        if any(q == "" for q in questions):
+            messagebox.showerror("Missing questions",
+                                 "Please fill in all 4 interview questions.")
+            return
+
         self._cancel_event.clear()
         self.run_btn.config(state="disabled")
         self.cancel_btn.config(state="normal", fg=TEXT)
         self.dl_all_btn.config(state="disabled")
         self._clear_grid()
-        threading.Thread(target=self._pipeline, args=(video, key), daemon=True).start()
+        threading.Thread(target=self._pipeline,
+                         args=(video, key, questions), daemon=True).start()
 
-    def _pipeline(self, video, key):
+    def _pipeline(self, video: str, key: str, questions: list[str]):
+        audio_path = None
         try:
-            sample_every = self.sample_var.get()
-            top_n        = self.top_var.get()
-            min_gap      = self.gap_var.get()
-            n_select     = max(1, self.selects_var.get())
+            client = genai.Client(api_key=key)
+            meta   = get_video_metadata(video)
+            fps    = meta["fps"]
+            dur    = meta["duration_s"]
 
-            self._update("01 / scanning with OpenCV…", 0)
-            raw = extract_sharp_frames(
-                video, sample_every,
-                progress_cb=lambda v: self._update(None, v),
-                cancel_event=self._cancel_event,
-            )
-
-            if self._cancel_event.is_set():
-                self._update("Cancelled.", 0)
-                return
-
-            diverse = temporal_diversity_filter(raw, min_gap, top_n)
-            self._update(
-                f"01 / done — {len(diverse)} candidates  ·  "
-                "02 / asking Gemini…", 50
-            )
-
-            picked = gemini_select(
-                diverse, key, n_select=n_select,
-                progress_cb=lambda v: self._update(None, v),
-                cancel_event=self._cancel_event,
-            )
+            # Stage 1: extract audio
+            self._update("01 / extracting audio…", 5)
+            try:
+                audio_path = extract_audio_to_wav(video, self._cancel_event)
+            except Exception as e:
+                self._update(f"Audio extraction failed ({e}), using equal splits.", 10)
+                audio_path = None
 
             if self._cancel_event.is_set():
                 self._update("Cancelled.", 0)
                 return
 
-            selected = [diverse[i] for i in picked[:n_select]]
-            self._update(f"{len(selected)} frames selected.", 100)
-            self.after(0, lambda: self._show_frames(selected, video))
+            # Stage 2: transcribe + segment
+            windows = None
+            if audio_path:
+                self._update("02 / transcribing audio…", 15)
+                try:
+                    chunks = transcribe_audio(client, audio_path, self._cancel_event)
+                    if chunks:
+                        windows = map_transcript_to_windows(chunks, questions, dur)
+                except Exception as e:
+                    self._update(f"Transcription failed ({e}), using equal splits.", 20)
+
+            if windows is None:
+                windows = equal_split_windows(questions, dur)
+
+            if self._cancel_event.is_set():
+                self._update("Cancelled.", 0)
+                return
+
+            # Stages 3+4: per-segment extraction + Gemini selection
+            results = []
+            for seg_idx, win in enumerate(windows):
+                if self._cancel_event.is_set():
+                    self._update("Cancelled.", 0)
+                    return
+
+                base_pct = 30 + seg_idx * 17
+                self._update(
+                    f"03 / Q{seg_idx + 1} — scanning "
+                    f"{win['start_s']:.1f}s – {win['end_s']:.1f}s…",
+                    base_pct,
+                )
+                candidates = extract_sharp_frames(
+                    video, SAMPLE_EVERY_N, fps,
+                    start_s=win["start_s"], end_s=win["end_s"],
+                    cancel_event=self._cancel_event,
+                )[:TOP_SHARP_PER_SEG]
+
+                if not candidates:
+                    self._update(f"Warning: no frames found in Q{seg_idx + 1} window.", base_pct + 4)
+                    continue
+
+                self._update(
+                    f"04 / Q{seg_idx + 1} — asking Gemini "
+                    f"({len(candidates)} candidates)…",
+                    base_pct + 8,
+                )
+                pick = gemini_pick_one_frame(
+                    client, candidates, win["question"], self._cancel_event
+                )
+                frame, score, orig_idx = candidates[pick]
+                results.append({
+                    "frame":    frame,
+                    "score":    score,
+                    "orig_idx": orig_idx,
+                    "question": win["question"],
+                    "label":    f"Q{seg_idx + 1}",
+                })
+
+            if self._cancel_event.is_set():
+                self._update("Cancelled.", 0)
+                return
+
+            self._update(f"{len(results)} frames selected.", 100)
+            self.after(0, lambda r=results: self._show_strip(r, video))
 
         except Exception as exc:
             self.after(0, lambda e=exc: messagebox.showerror("Error", str(e)))
             self._update(f"Error: {exc}", 0)
         finally:
+            if audio_path and os.path.exists(audio_path):
+                try:
+                    os.unlink(audio_path)
+                except OSError:
+                    pass
             self.after(0, lambda: self.run_btn.config(state="normal"))
             self.after(0, lambda: self.cancel_btn.config(state="disabled", fg=MUTED))
 
     def _zoom(self, idx: int):
         if idx >= len(self._frame_data):
             return
-        frame, score, orig_idx = self._frame_data[idx]
-        ZoomWindow(self, frame,
-                   title=f"#{idx+1}  frame {orig_idx}  ·  sharpness {score:,.0f}")
+        item = self._frame_data[idx]
+        ZoomWindow(self, item["frame"],
+                   title=f"{item['label']}  ·  frame {item['orig_idx']}  ·  sharpness {item['score']:,.0f}")
 
     def _save_dialog(self, initial_file: str):
         path = filedialog.asksaveasfilename(
@@ -667,10 +766,10 @@ class App(tk.Tk):
     def _download_single(self, idx: int):
         if idx >= len(self._frame_data):
             return
-        frame, score, orig_idx = self._frame_data[idx]
-        path = self._save_dialog(f"frame_{idx+1}_{orig_idx}.jpg")
+        item = self._frame_data[idx]
+        path = self._save_dialog(f"{item['label']}_frame_{item['orig_idx']}.jpg")
         if path:
-            self._write_frame(path, frame)
+            self._write_frame(path, item["frame"])
             self._update(f"Saved → {os.path.basename(path)}", self.progress["value"])
 
     def _download_all(self):
@@ -683,7 +782,7 @@ class App(tk.Tk):
                 "Video path is missing or invalid. Re-run extraction and try again.",
             )
             return
-        video_dir = os.path.dirname(os.path.abspath(video_path))
+        video_dir      = os.path.dirname(os.path.abspath(video_path))
         video_basename = os.path.splitext(os.path.basename(video_path))[0]
         folder = os.path.join(video_dir, video_basename)
         try:
@@ -691,9 +790,10 @@ class App(tk.Tk):
         except OSError as e:
             messagebox.showerror("Save All", f"Could not create folder:\n{e}")
             return
-        for i, (frame, _score, orig_idx) in enumerate(self._frame_data):
+        for item in self._frame_data:
             self._write_frame(
-                os.path.join(folder, f"frame_{i+1}_{orig_idx}.jpg"), frame
+                os.path.join(folder, f"{item['label']}_frame_{item['orig_idx']}.jpg"),
+                item["frame"],
             )
         self._last_save_dir = folder
         self._update(
@@ -714,6 +814,7 @@ class App(tk.Tk):
     def _clear_grid(self):
         self._tk_images.clear()
         self._frame_data.clear()
+        self._question_labels.clear()
         for outer in self._cell_frames:
             outer.destroy()
         self._cell_frames.clear()
@@ -723,20 +824,20 @@ class App(tk.Tk):
         self._results_section.pack_forget()
 
     def _build_grid_cells(self, n: int):
-        """Build exactly n cells in the grid (2 columns)."""
+        """Build exactly n cells in a 1-column vertical strip."""
         for outer in self._cell_frames:
             outer.destroy()
         self._cell_frames.clear()
         self._cells.clear()
         self._captions.clear()
         self._dl_btns.clear()
+        self._question_labels.clear()
 
-        for c in range(GRID_COLS):
-            self._grid_frame.columnconfigure(c, weight=1)
+        self._grid_frame.columnconfigure(0, weight=1)
+
         for i in range(n):
-            r, c = divmod(i, GRID_COLS)
             outer = tk.Frame(self._grid_frame, bg=BORDER)
-            outer.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
+            outer.grid(row=i, column=0, padx=6, pady=6, sticky="nsew")
             self._cell_frames.append(outer)
 
             inner = tk.Frame(outer, bg=BG2)
@@ -764,38 +865,43 @@ class App(tk.Tk):
             )
             dl_btn.pack(side="right")
 
+            q_lbl = tk.Label(inner, bg=BG2, fg=TEXT,
+                             text="", font=("Helvetica", 10, "italic"),
+                             anchor="w", justify="left", wraplength=500)
+            q_lbl.pack(fill="x", padx=8, pady=(0, 8))
+
             self._cells.append(img_lbl)
             self._captions.append(cap_lbl)
             self._dl_btns.append(dl_btn)
+            self._question_labels.append(q_lbl)
 
-    def _show_frames(self, frames_data, video_path: str | None = None):
+    def _show_strip(self, results: list[dict], video_path: str | None = None):
         if video_path:
             self._last_video_path = video_path
         self._results_section.pack(fill="both", expand=True)
-        n = len(frames_data)
+        n = len(results)
         self._build_grid_cells(n)
         self._tk_images.clear()
-        self._frame_data = list(frames_data)
+        self._frame_data = list(results)
 
-        for i, (frame, score, orig_idx) in enumerate(frames_data):
-            lbl = self._cells[i]
+        for i, item in enumerate(results):
+            lbl     = self._cells[i]
             cap_lbl = self._captions[i]
-            dl_btn = self._dl_btns[i]
+            q_lbl   = self._question_labels[i]
+            dl_btn  = self._dl_btns[i]
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(item["frame"], cv2.COLOR_BGR2RGB)
             img = Image.fromarray(rgb)
-            cell_w = max(lbl.winfo_width(), 380)
-            cell_h = max(lbl.winfo_height(), 260)
-            img.thumbnail((cell_w - 2, cell_h - 2), Image.LANCZOS)
-
+            img.thumbnail((STRIP_THUMB_W, STRIP_THUMB_H), Image.LANCZOS)
             tk_img = ImageTk.PhotoImage(img)
             self._tk_images.append(tk_img)
 
             lbl.config(image=tk_img, text="")
             cap_lbl.config(
-                text=f"#{i+1}  ·  frame {orig_idx}  ·  ♯ {score:,.0f}",
+                text=f"{item['label']}  ·  frame {item['orig_idx']}  ·  sharpness {item['score']:,.0f}",
                 fg=TEXT,
             )
+            q_lbl.config(text=item["question"])
             dl_btn.config(state="normal", fg=TEXT)
 
         self.dl_all_btn.config(state="normal", fg=TEXT)

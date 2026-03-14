@@ -26,8 +26,8 @@ from PIL import Image, ImageTk
 SAMPLE_EVERY_N   = 30
 TOP_N_SHARP      = 150
 GEMINI_SELECTS   = 10
-DISPLAY_N        = 50   # max pre-built grid cells (covers full selects_var range)
 THUMB_W, THUMB_H = 320, 240
+GRID_COLS        = 2
 GEMINI_MODEL     = "gemini-2.5-flash"
 GEMINI_BATCH     = 30
 TEMPORAL_GAP     = 90
@@ -141,7 +141,8 @@ def _gemini_pick_batch(client, batch_frames, batch_offset: int,
         "- Avoid picking multiple nearly identical frames — prioritize variety.\n"
         "\n"
         f"There are {len(batch_frames)} frames indexed 0 to {len(batch_frames)-1}.\n"
-        f"Pick the best {total_select} (or fewer if there aren't enough good ones).\n"
+        f"You MUST return exactly {min(total_select, len(batch_frames))} indices — your best choices in order. "
+        f"If fewer than {total_select} frames meet the bar, still return that many (your top picks).\n"
         'Return ONLY a JSON object exactly like: {"indices": [0, 1, 2]}'
     )
 
@@ -257,9 +258,11 @@ class App(tk.Tk):
         self._build_how_it_works()
         self._build_controls()
         self._build_progress()
-        self._separator()
-        self._build_results_header()
-        self._build_grid()
+        # Results section: built but not shown until processing completes
+        self._results_section = tk.Frame(self, bg=BG)
+        tk.Frame(self._results_section, bg=BORDER, height=1).pack(fill="x")
+        self._build_results_header(self._results_section)
+        self._build_grid(self._results_section)
 
     def _build_header(self):
         hdr = tk.Frame(self, bg=BG, pady=22)
@@ -475,8 +478,8 @@ class App(tk.Tk):
                                         style="TProgressbar")
         self.progress.pack(fill="x", pady=(0, 8))
 
-    def _build_results_header(self):
-        row = tk.Frame(self, bg=BG)
+    def _build_results_header(self, parent):
+        row = tk.Frame(parent, bg=BG)
         row.pack(fill="x", padx=32, pady=(10, 4))
 
         tk.Label(row, text="RESULTS",
@@ -499,8 +502,8 @@ class App(tk.Tk):
         )
         self.dl_all_btn.pack(side="right")
 
-    def _build_grid(self):
-        wrapper = tk.Frame(self, bg=BG)
+    def _build_grid(self, parent):
+        wrapper = tk.Frame(parent, bg=BG)
         wrapper.pack(fill="both", expand=True, padx=24, pady=(0, 24))
 
         canvas = tk.Canvas(wrapper, bg=BG, highlightthickness=0)
@@ -533,49 +536,10 @@ class App(tk.Tk):
             canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
             canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
 
-        self._cells:    list[tk.Label]  = []
-        self._captions: list[tk.Label]  = []
-        self._dl_btns:  list[tk.Button] = []
-
-        COLS = 2
-        for i in range(DISPLAY_N):
-            r, c = divmod(i, COLS)
-            self._grid_frame.columnconfigure(c, weight=1)
-
-            # card: 1px border via outer/inner frame trick
-            outer = tk.Frame(self._grid_frame, bg=BORDER)
-            outer.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
-
-            inner = tk.Frame(outer, bg=BG2)
-            inner.pack(fill="both", expand=True, padx=1, pady=1)
-
-            img_lbl = tk.Label(inner, bg=BG2, text="",
-                               relief="flat", cursor="hand2")
-            img_lbl.pack(fill="both", expand=True)
-            img_lbl.bind("<Button-1>", lambda e, idx=i: self._zoom(idx))
-
-            footer = tk.Frame(inner, bg=BG2, pady=5)
-            footer.pack(fill="x", padx=8)
-
-            cap_lbl = tk.Label(footer, bg=BG2, fg=MUTED,
-                               text=f"—",
-                               font=("Helvetica", 7), anchor="w")
-            cap_lbl.pack(side="left")
-
-            dl_btn = tk.Button(
-                footer, text="Save",
-                command=lambda idx=i: self._download_single(idx),
-                bg=BG2, fg=MUTED,
-                font=("Helvetica", 7), relief="flat",
-                padx=6, pady=0, cursor="hand2",
-                state="disabled",
-                activebackground=BG2, activeforeground=WHITE,
-            )
-            dl_btn.pack(side="right")
-
-            self._cells.append(img_lbl)
-            self._captions.append(cap_lbl)
-            self._dl_btns.append(dl_btn)
+        self._cells:      list[tk.Label]   = []
+        self._captions:   list[tk.Label]   = []
+        self._dl_btns:    list[tk.Button]  = []
+        self._cell_frames: list[tk.Frame]  = []  # outer frames, for destroy on clear
 
     def _separator(self, pady=(0, 0)):
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", pady=pady)
@@ -736,29 +700,75 @@ class App(tk.Tk):
     def _clear_grid(self):
         self._tk_images.clear()
         self._frame_data.clear()
-        for lbl, cap, btn in zip(self._cells, self._captions, self._dl_btns):
-            lbl.config(image="", text="")
-            cap.config(text="—")
-            btn.config(state="disabled", fg=MUTED)
+        for outer in self._cell_frames:
+            outer.destroy()
+        self._cell_frames.clear()
+        self._cells.clear()
+        self._captions.clear()
+        self._dl_btns.clear()
+        self._results_section.pack_forget()
+
+    def _build_grid_cells(self, n: int):
+        """Build exactly n cells in the grid (2 columns)."""
+        for outer in self._cell_frames:
+            outer.destroy()
+        self._cell_frames.clear()
+        self._cells.clear()
+        self._captions.clear()
+        self._dl_btns.clear()
+
+        for c in range(GRID_COLS):
+            self._grid_frame.columnconfigure(c, weight=1)
+        for i in range(n):
+            r, c = divmod(i, GRID_COLS)
+            outer = tk.Frame(self._grid_frame, bg=BORDER)
+            outer.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
+            self._cell_frames.append(outer)
+
+            inner = tk.Frame(outer, bg=BG2)
+            inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+            img_lbl = tk.Label(inner, bg=BG2, text="", relief="flat", cursor="hand2")
+            img_lbl.pack(fill="both", expand=True)
+            img_lbl.bind("<Button-1>", lambda e, idx=i: self._zoom(idx))
+
+            footer = tk.Frame(inner, bg=BG2, pady=5)
+            footer.pack(fill="x", padx=8)
+
+            cap_lbl = tk.Label(footer, bg=BG2, fg=MUTED, text="—",
+                               font=("Helvetica", 7), anchor="w")
+            cap_lbl.pack(side="left")
+
+            dl_btn = tk.Button(
+                footer, text="Save",
+                command=lambda idx=i: self._download_single(idx),
+                bg=BG2, fg=MUTED,
+                font=("Helvetica", 7), relief="flat",
+                padx=6, pady=0, cursor="hand2",
+                state="normal",
+                activebackground=BG2, activeforeground=WHITE,
+            )
+            dl_btn.pack(side="right")
+
+            self._cells.append(img_lbl)
+            self._captions.append(cap_lbl)
+            self._dl_btns.append(dl_btn)
 
     def _show_frames(self, frames_data):
+        self._results_section.pack(fill="both", expand=True)
+        n = len(frames_data)
+        self._build_grid_cells(n)
         self._tk_images.clear()
         self._frame_data = list(frames_data)
 
-        for i, (lbl, cap_lbl, dl_btn) in enumerate(
-            zip(self._cells, self._captions, self._dl_btns)
-        ):
-            if i >= len(frames_data):
-                lbl.config(image="", text="")
-                cap_lbl.config(text="—")
-                dl_btn.config(state="disabled", fg=MUTED)
-                continue
+        for i, (frame, score, orig_idx) in enumerate(frames_data):
+            lbl = self._cells[i]
+            cap_lbl = self._captions[i]
+            dl_btn = self._dl_btns[i]
 
-            frame, score, orig_idx = frames_data[i]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(rgb)
-
-            cell_w = max(lbl.winfo_width(),  380)
+            cell_w = max(lbl.winfo_width(), 380)
             cell_h = max(lbl.winfo_height(), 260)
             img.thumbnail((cell_w - 2, cell_h - 2), Image.LANCZOS)
 

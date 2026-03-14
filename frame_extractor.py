@@ -19,7 +19,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
-import google.generativeai as genai
+import google.genai as genai
 from PIL import Image, ImageTk
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -109,7 +109,7 @@ def temporal_diversity_filter(frames, min_gap: int, limit: int):
 
 
 # ── Stage 2 : Gemini selection ───────────────────────────────────────────────
-def _gemini_pick_batch(model, batch_frames, batch_offset: int,
+def _gemini_pick_batch(client, batch_frames, batch_offset: int,
                        total_select: int, cancel_event) -> list[int]:
     prompt = (
         "You are a professional photo editor curating frames for a vertical photo strip. "
@@ -152,9 +152,8 @@ def _gemini_pick_batch(model, batch_frames, batch_offset: int,
         img.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=80)
-        buf.seek(0)
         parts.append(f"\nFrame {i}:")
-        parts.append(Image.open(buf))
+        parts.append(genai.types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
 
     if cancel_event and cancel_event.is_set():
         return []
@@ -163,7 +162,9 @@ def _gemini_pick_batch(model, batch_frames, batch_offset: int,
         if cancel_event and cancel_event.is_set():
             return []
         try:
-            response = model.generate_content(parts)
+            response = client.models.generate_content(
+                model=GEMINI_MODEL, contents=parts
+            )
             text = response.text.strip()
             m = re.search(r'\{[^{}]*"indices"[^{}]*\}', text, re.DOTALL)
             if m:
@@ -181,9 +182,8 @@ def _gemini_pick_batch(model, batch_frames, batch_offset: int,
 
 def gemini_select(top_frames, api_key: str, n_select: int = GEMINI_SELECTS,
                   progress_cb=None, cancel_event: threading.Event = None) -> list[int]:
-    genai.configure(api_key=api_key)
-    model   = genai.GenerativeModel(GEMINI_MODEL)
-    n       = len(top_frames)
+    client = genai.Client(api_key=api_key)
+    n      = len(top_frames)
     batches = [top_frames[i:i + GEMINI_BATCH] for i in range(0, n, GEMINI_BATCH)]
     per_batch_select = max(3, n_select // len(batches) + 1)
 
@@ -193,7 +193,7 @@ def gemini_select(top_frames, api_key: str, n_select: int = GEMINI_SELECTS,
             return []
         if progress_cb:
             progress_cb(55 + b_idx / len(batches) * 20)
-        local_picks   = _gemini_pick_batch(model, batch, b_idx * GEMINI_BATCH,
+        local_picks   = _gemini_pick_batch(client, batch, b_idx * GEMINI_BATCH,
                                            per_batch_select, cancel_event)
         global_offset = b_idx * GEMINI_BATCH
         for li in local_picks:
@@ -211,7 +211,7 @@ def gemini_select(top_frames, api_key: str, n_select: int = GEMINI_SELECTS,
         return [f[3] for f in finalists]
 
     final_batch  = [(f[0], f[1], f[2]) for f in finalists]
-    final_picks  = _gemini_pick_batch(model, final_batch, 0,
+    final_picks  = _gemini_pick_batch(client, final_batch, 0,
                                       n_select, cancel_event)
     if progress_cb:
         progress_cb(90)
@@ -286,7 +286,7 @@ class App(tk.Tk):
         tk.Label(
             outer, text="HOW IT WORKS",
             font=("Helvetica", 8, "bold"),
-            fg=MUTED, bg=BG, anchor="w", letterSpacing=2,
+            fg=MUTED, bg=BG, anchor="w",
         ).pack(anchor="w", pady=(0, 6))
 
         # two-column layout: Stage 1 | Stage 2
@@ -434,8 +434,8 @@ class App(tk.Tk):
             ).pack(side="left")
 
     def _spin(self, parent, label, var, lo, hi):
-        grp = tk.Frame(parent, bg=BG, padx=(0, 20))
-        grp.pack(side="left")
+        grp = tk.Frame(parent, bg=BG)
+        grp.pack(side="left", padx=(0, 20))
         tk.Label(grp, text=label,
                  font=("Helvetica", 7, "bold"),
                  fg=MUTED, bg=BG).pack(anchor="w", pady=(0, 3))
@@ -444,7 +444,7 @@ class App(tk.Tk):
             width=6,
             bg=BG2, fg=WHITE, insertbackground=WHITE,
             relief="flat", bd=0,
-            buttonbackground=BG2, buttonforeground=MUTED,
+            buttonbackground=BG2,
             highlightthickness=1,
             highlightbackground=BORDER,
             highlightcolor=WHITE,
@@ -463,7 +463,7 @@ class App(tk.Tk):
 
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("W.TProgressbar",
+        style.configure("TProgressbar",
                         troughcolor=BG2,
                         background=WHITE,
                         bordercolor=BG,
@@ -472,12 +472,12 @@ class App(tk.Tk):
                         thickness=2)
         self.progress = ttk.Progressbar(prog, length=800,
                                         mode="determinate",
-                                        style="W.TProgressbar")
+                                        style="TProgressbar")
         self.progress.pack(fill="x", pady=(0, 8))
 
     def _build_results_header(self):
-        row = tk.Frame(self, bg=BG, padx=32, pady=(10, 4))
-        row.pack(fill="x")
+        row = tk.Frame(self, bg=BG)
+        row.pack(fill="x", padx=32, pady=(10, 4))
 
         tk.Label(row, text="RESULTS",
                  font=("Helvetica", 7, "bold"),

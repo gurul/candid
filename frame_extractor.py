@@ -248,6 +248,7 @@ class App(tk.Tk):
         self.minsize(900, 720)
         self._tk_images:  list[ImageTk.PhotoImage] = []
         self._frame_data: list                     = []
+        self._last_video_path: str | None          = None  # used for Save All folder
         self._cancel_event  = threading.Event()
         self._last_save_dir = os.path.expanduser("~/Pictures")
         self._build_ui()
@@ -628,7 +629,7 @@ class App(tk.Tk):
 
             selected = [diverse[i] for i in picked[:n_select]]
             self._update(f"{len(selected)} frames selected.", 100)
-            self.after(0, lambda: self._show_frames(selected))
+            self.after(0, lambda: self._show_frames(selected, video))
 
         except Exception as exc:
             self.after(0, lambda e=exc: messagebox.showerror("Error", str(e)))
@@ -675,20 +676,33 @@ class App(tk.Tk):
     def _download_all(self):
         if not self._frame_data:
             return
-        folder = filedialog.askdirectory(
-            title="Save all frames to…",
-            initialdir=self._last_save_dir,
-        )
-        if not folder:
+        video_path = self._last_video_path or self.video_var.get().strip()
+        if not video_path or not os.path.isfile(video_path):
+            messagebox.showerror(
+                "Save All",
+                "Video path is missing or invalid. Re-run extraction and try again.",
+            )
             return
-        self._last_save_dir = folder
+        video_dir = os.path.dirname(os.path.abspath(video_path))
+        video_basename = os.path.splitext(os.path.basename(video_path))[0]
+        folder = os.path.join(video_dir, video_basename)
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Save All", f"Could not create folder:\n{e}")
+            return
         for i, (frame, _score, orig_idx) in enumerate(self._frame_data):
             self._write_frame(
                 os.path.join(folder, f"frame_{i+1}_{orig_idx}.jpg"), frame
             )
+        self._last_save_dir = folder
         self._update(
             f"Saved {len(self._frame_data)} frames → {folder}",
             self.progress["value"],
+        )
+        messagebox.showinfo(
+            "Save All",
+            f"Saved {len(self._frame_data)} frames to:\n{folder}",
         )
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -754,7 +768,9 @@ class App(tk.Tk):
             self._captions.append(cap_lbl)
             self._dl_btns.append(dl_btn)
 
-    def _show_frames(self, frames_data):
+    def _show_frames(self, frames_data, video_path: str | None = None):
+        if video_path:
+            self._last_video_path = video_path
         self._results_section.pack(fill="both", expand=True)
         n = len(frames_data)
         self._build_grid_cells(n)
